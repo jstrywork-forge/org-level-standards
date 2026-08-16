@@ -120,7 +120,13 @@ steps:
       std="$tmp/standards"
       diff_file="$tmp/pr.diff"
 
-      git diff "origin/$(System.PullRequest.TargetBranch)"... > "$diff_file"
+      # System.PullRequest.TargetBranch arrives as `refs/heads/main`, not `main`.
+      # Concatenating it onto `origin/` yields `origin/refs/heads/main`, which is
+      # not a revision - git says so, the step swallows it as an empty diff, and
+      # the run goes green having reviewed nothing.
+      target="${TARGET_BRANCH#refs/heads/}"
+      git fetch --no-tags origin "$target" >/dev/null 2>&1 || true
+      git diff "origin/$target"... > "$diff_file"
       if [ ! -s "$diff_file" ]; then
         echo "Empty diff; nothing to review."
         exit 0
@@ -235,6 +241,7 @@ steps:
       exit 0
     displayName: AI review (advisory)
     env:
+      TARGET_BRANCH: $(System.PullRequest.TargetBranch)
       AI_REVIEW_ENDPOINT: $(aiReviewEndpoint)
       AI_REVIEW_KEY: $(aiReviewKey)
       AI_REVIEW_DEPLOYMENT: $(aiReviewDeployment)
