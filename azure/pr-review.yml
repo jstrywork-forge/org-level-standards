@@ -144,9 +144,14 @@ steps:
       # applies. Falling back to a repo-local copy would let a repository weaken
       # the instruction it is judged by, which is the one thing this design is
       # trying to prevent.
+      # The prompt contract is synced into the repo alongside the instruction
+      # sets and is covered by the same drift check, so a local edit is reported
+      # rather than silently obeyed. The live copy is still preferred when the
+      # standards repo is reachable.
       prompt="$std/azure/pr-review-prompt.md"
+      [ -f "$prompt" ] || prompt=".github/instructions/pr-review-prompt.md"
       if [ ! -f "$prompt" ]; then
-        echo "##vso[task.logissue type=warning]Prompt contract unavailable (standards fetch failed). Skipping the review; the build still gates this PR."
+        echo "##vso[task.logissue type=warning]No prompt contract found. Skipping the review; the build still gates this PR."
         exit 0
       fi
 
