@@ -5,14 +5,25 @@
 #
 #   - The developer is in charge. A reviewer that blocks is a gate, and a gate
 #     that is sometimes wrong gets routed around within a month.
-#   - The real enforcement already exists. Analysers, warnings-as-errors,
-#     `dotnet format --verify-no-changes` and the tests all run in build.yml and
-#     all fail the build on their own. This step adds judgement, not gating.
+#   - The real enforcement already exists. Lint, analysers, type checking and the
+#     tests all run in the build and all fail it on their own. This step adds
+#     judgement, not gating.
 #
 # It follows that when the AI endpoint is unavailable, NOTHING IS LOST that the
-# build was relying on. The step reports that it could not run and exits 0. That
-# is the degraded mode, and it is the same shape as the fully-working mode: the
-# developer reads the code, the build gates it, and this comment is a bonus.
+# build was relying on. The step reports that it could not run and exits 0.
+#
+# ---------------------------------------------------------------------------
+# Prerequisites in the ADO project, each of which fails LOUDLY if missing:
+#
+#   1. Variable group `ai-review` with `aiReviewEndpoint`, `aiReviewKey` and
+#      `aiReviewDeployment`. The key must be marked secret.
+#   2. "Allow scripts to access the OAuth token" enabled on the pipeline.
+#   3. The build service identity granted "Contribute to pull requests" on this
+#      repository, and "Read" on the standards repository.
+#
+# Without 2 or 3 the comment POST returns 203/403 and the review is written but
+# never seen - which is why the POST checks its response rather than trusting it.
+# ---------------------------------------------------------------------------
 
 trigger: none
 
@@ -25,8 +36,6 @@ pool:
   vmImage: ubuntu-latest
 
 variables:
-  # Holds the endpoint and key for whichever assistant performs the review.
-  # No secret appears in this file.
   - group: ai-review
 
   # The standards repo is read LIVE at review time rather than trusting the copy
@@ -34,123 +43,198 @@ variables:
   # weaken the standard the PR is judged against.
   - name: standardsRepo
     value: engineering-standards
-  - name: standardsRef
-    value: refs/heads/main
+  - name: standardsBranch
+    value: main
+
+  # A diff larger than this is summarised rather than sent whole. Sending a
+  # 20k-line diff produces a review of whatever fitted in the window, with no
+  # indication that the rest was dropped - a silently partial review is worse
+  # than an honest refusal.
+  - name: maxDiffBytes
+    value: 200000
 
 steps:
   - checkout: self
-    fetchDepth: 0        # the diff needs the merge base, which a shallow clone lacks
+    fetchDepth: 0 # the diff needs the merge base, which a shallow clone lacks
     persistCredentials: true
 
   # ---------------------------------------------------------------------------
   # Fetch the authoritative standards.
   #
-  # continueOnError: the standards repo being unreachable degrades the review to
-  # repo-level only. It does not fail the PR - see the header.
+  # `System.CollectionUri` is already a full URL ending in a slash, so it is
+  # concatenated - never embedded in another URL. The token goes in an extra
+  # header rather than in the URL, which keeps it out of `git remote -v` and out
+  # of any error message that echoes the remote.
   # ---------------------------------------------------------------------------
   - script: |
-      set -e
-      git clone --depth 1 --branch "${STANDARDS_REF##*/}" \
-        "https://$(System.AccessToken)@dev.azure.com/$(System.CollectionUri)/$(System.TeamProject)/_git/$(standardsRepo)" \
-        "$(Agent.TempDirectory)/standards"
-      echo "Standards fetched at $(cd "$(Agent.TempDirectory)/standards" && git rev-parse --short HEAD)"
+      set -uo pipefail
+      dest="$(Agent.TempDirectory)/standards"
+      url="$(System.CollectionUri)$(System.TeamProject)/_git/$(standardsRepo)"
+
+      if git -c http.extraheader="AUTHORIZATION: bearer $(System.AccessToken)" \
+           clone --depth 1 --branch "$(standardsBranch)" "$url" "$dest" 2>/dev/null; then
+        echo "Standards fetched at $(git -C "$dest" rev-parse --short HEAD)"
+      else
+        echo "##vso[task.logissue type=warning]Could not fetch $(standardsRepo). Falling back to the copy synced into this repo."
+      fi
     displayName: Fetch org standards
     continueOnError: true
-    env:
-      STANDARDS_REF: $(standardsRef)
 
   # ---------------------------------------------------------------------------
   # Drift check.
   #
-  # Re-hashes the synced copy in this repo against org.lock.json. A mismatch
-  # means someone hand-edited a file that is meant to be overwritten by the sync,
-  # which is worth SAYING but is not worth blocking a merge over - the live copy
-  # above is what the review actually judges against, so the gate is unaffected.
+  # Re-hashes the synced copy against org.lock.json. A mismatch means someone
+  # hand-edited a file meant to be overwritten by the sync - worth SAYING, not
+  # worth blocking a merge over, because the live copy above is what the review
+  # actually judges against.
   # ---------------------------------------------------------------------------
   - script: |
       lock=.github/instructions/org.lock.json
       [ -f "$lock" ] || { echo "No lock file; repo is not synced to any standards version."; exit 0; }
 
-      fail=0
+      drift=0
       for f in .github/instructions/org/*.md; do
+        [ -e "$f" ] || continue
         name=$(basename "$f")
         expected=$(grep -o "\"$name\": *\"sha256:[a-f0-9]*\"" "$lock" | grep -o '[a-f0-9]\{64\}')
         actual=$(sha256sum "$f" | cut -d' ' -f1)
         if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
-          echo "##vso[task.logissue type=warning]$name has been edited locally; synced standards are overwritten on next sync."
-          fail=1
+          echo "##vso[task.logissue type=warning]$name has been edited locally; synced standards are overwritten on the next sync."
+          drift=1
         fi
       done
-      [ $fail -eq 0 ] && echo "Synced standards match the lock file."
+      [ $drift -eq 0 ] && echo "Synced standards match the lock file."
       exit 0
     displayName: Check synced standards for drift
 
   # ---------------------------------------------------------------------------
   # The review itself.
   #
-  # The call to the assistant is deliberately the ONLY vendor-specific part, and
-  # it is one command. Everything above and below - the diff, the artifacts, the
-  # prompt contract, the comment - is portable. Changing assistant means editing
-  # the marked block, not this pipeline.
+  # The call to the assistant is the ONLY vendor-specific part and it is one
+  # curl. Everything else - the diff, the prompt contract, the comment - is
+  # portable. Changing assistant means editing the marked block.
   # ---------------------------------------------------------------------------
   - script: |
-      set -u
-      diff_file="$(Agent.TempDirectory)/pr.diff"
-      git diff "origin/$(System.PullRequest.TargetBranch)"... > "$diff_file"
+      set -uo pipefail
+      tmp="$(Agent.TempDirectory)"
+      std="$tmp/standards"
+      diff_file="$tmp/pr.diff"
 
+      git diff "origin/$(System.PullRequest.TargetBranch)"... > "$diff_file"
       if [ ! -s "$diff_file" ]; then
         echo "Empty diff; nothing to review."
         exit 0
       fi
 
-      # Assemble what the prompt contract says the reviewer is given.
+      size=$(wc -c < "$diff_file")
+      truncated=""
+      if [ "$size" -gt "$(maxDiffBytes)" ]; then
+        head -c "$(maxDiffBytes)" "$diff_file" > "$diff_file.cut" && mv "$diff_file.cut" "$diff_file"
+        truncated="**This diff was truncated at $(maxDiffBytes) bytes. Files after the cut were not reviewed.**"
+        echo "##vso[task.logissue type=warning]Diff truncated at $(maxDiffBytes) bytes; the review is partial and says so."
+      fi
+
+      # The prompt contract lives in the standards repo beside the rules it
+      # applies. Falling back to a repo-local copy would let a repository weaken
+      # the instruction it is judged by, which is the one thing this design is
+      # trying to prevent.
+      prompt="$std/azure/pr-review-prompt.md"
+      if [ ! -f "$prompt" ]; then
+        echo "##vso[task.logissue type=warning]Prompt contract unavailable (standards fetch failed). Skipping the review; the build still gates this PR."
+        exit 0
+      fi
+
+      # Live standards preferred; the synced copy is the degraded fallback.
+      if ls "$std"/instructions/*.md >/dev/null 2>&1; then
+        standards_src="$std/instructions"
+        standards_note="fetched live from $(standardsRepo)"
+      elif ls .github/instructions/org/*.md >/dev/null 2>&1; then
+        standards_src=".github/instructions/org"
+        standards_note="SYNCED COPY - the live fetch failed, so these may be stale"
+      else
+        standards_src=""
+        standards_note="unavailable - this review is repo-level only"
+      fi
+
       {
-        cat pipelines/pr-review-prompt.md
+        cat "$prompt"
+        [ -n "$truncated" ] && { echo; echo "$truncated"; }
         echo; echo "## Repository conventions"; echo
-        cat .github/copilot-instructions.md
-        echo; echo "## Organisation standards (authoritative, fetched live)"; echo
-        cat "$(Agent.TempDirectory)"/standards/standards/*.md 2>/dev/null \
-          || cat .github/instructions/org/*.md 2>/dev/null \
-          || echo "(unavailable - review is repo-level only)"
+        cat .github/copilot-instructions.md 2>/dev/null || echo "(none)"
+        echo; echo "## Organisation standards ($standards_note)"; echo
+        [ -n "$standards_src" ] && cat "$standards_src"/*.md
         echo; echo "## Diff"; echo '```diff'
         cat "$diff_file"
         echo '```'
-      } > "$(Agent.TempDirectory)/review-input.md"
+      } > "$tmp/review-input.md"
 
-      # ---- vendor-specific block: replace this one call ----------------------
-      # <PLACEHOLDER>: confirm the approved endpoint before wiring this up.
-      # Whatever runs here must read review-input.md and write review-output.md.
-      if [ -z "${AI_REVIEW_ENDPOINT:-}" ]; then
+      # ---- vendor-specific block: Azure OpenAI --------------------------------
+      if [ -z "${AI_REVIEW_ENDPOINT:-}" ] || [ -z "${AI_REVIEW_KEY:-}" ]; then
         echo "##vso[task.logissue type=warning]No AI review endpoint configured; skipping. The build still gates this PR."
         exit 0
       fi
 
-      curl -sS --fail --max-time 180 \
-        -H "Content-Type: application/json" \
-        -H "Authorization: Bearer ${AI_REVIEW_KEY}" \
-        --data-binary @<(jq -Rs '{input: .}' "$(Agent.TempDirectory)/review-input.md") \
-        "${AI_REVIEW_ENDPOINT}" \
-        | jq -r '.output // empty' > "$(Agent.TempDirectory)/review-output.md" || {
-          echo "##vso[task.logissue type=warning]AI review call failed. The build still gates this PR."
-          exit 0
-        }
+      jq -n --rawfile body "$tmp/review-input.md" '{
+        messages: [
+          { role: "system", content: "You review pull requests. Follow the prompt contract in the user message exactly, including its restraint rules. Reply with GitHub-flavoured markdown only." },
+          { role: "user",   content: $body }
+        ],
+        temperature: 0.2,
+        max_tokens: 2000
+      }' > "$tmp/request.json"
+
+      url="${AI_REVIEW_ENDPOINT%/}/openai/deployments/${AI_REVIEW_DEPLOYMENT}/chat/completions?api-version=2024-10-21"
+
+      if ! curl -sS --fail --max-time 240 \
+           -H "Content-Type: application/json" \
+           -H "api-key: ${AI_REVIEW_KEY}" \
+           --data-binary "@$tmp/request.json" \
+           "$url" > "$tmp/response.json"; then
+        echo "##vso[task.logissue type=warning]AI review call failed. The build still gates this PR."
+        exit 0
+      fi
+
+      jq -r '.choices[0].message.content // empty' "$tmp/response.json" > "$tmp/review-output.md"
       # ---- end vendor-specific block -----------------------------------------
 
-      [ -s "$(Agent.TempDirectory)/review-output.md" ] || { echo "Reviewer returned nothing."; exit 0; }
+      if [ ! -s "$tmp/review-output.md" ]; then
+        echo "Reviewer returned nothing."
+        exit 0
+      fi
+
+      {
+        echo "### Automated standards review"
+        echo
+        cat "$tmp/review-output.md"
+        echo
+        echo "---"
+        echo "_Advisory. Standards $standards_note. This comment never blocks a merge._"
+      } > "$tmp/comment.md"
 
       jq -Rs '{comments: [{parentCommentId: 0, content: ., commentType: 1}], status: 1}' \
-        "$(Agent.TempDirectory)/review-output.md" > "$(Agent.TempDirectory)/thread.json"
+        "$tmp/comment.md" > "$tmp/thread.json"
 
-      curl -sS --fail -X POST \
+      # The POST is checked rather than trusted. Without "Allow scripts to access
+      # the OAuth token", or without Contribute to pull requests, ADO answers 203
+      # with an HTML sign-in page and a bare `curl` would call that success -
+      # producing a green run and no comment, which is the failure that wastes
+      # an afternoon.
+      code=$(curl -sS -o "$tmp/post.out" -w '%{http_code}' -X POST \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $(System.AccessToken)" \
-        --data-binary "@$(Agent.TempDirectory)/thread.json" \
-        "$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.ID)/pullRequests/$(System.PullRequest.PullRequestId)/threads?api-version=7.1" \
-        && echo "Review posted." \
-        || echo "##vso[task.logissue type=warning]Could not post the review comment."
+        --data-binary "@$tmp/thread.json" \
+        "$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.ID)/pullRequests/$(System.PullRequest.PullRequestId)/threads?api-version=7.1")
+
+      if [ "$code" = "200" ] || [ "$code" = "201" ]; then
+        echo "Review posted."
+      else
+        echo "##vso[task.logissue type=warning]Could not post the review comment (HTTP $code). Check 'Allow scripts to access the OAuth token' and the build service's Contribute to pull requests permission."
+        head -c 400 "$tmp/post.out"
+      fi
 
       exit 0
     displayName: AI review (advisory)
     env:
       AI_REVIEW_ENDPOINT: $(aiReviewEndpoint)
       AI_REVIEW_KEY: $(aiReviewKey)
+      AI_REVIEW_DEPLOYMENT: $(aiReviewDeployment)
