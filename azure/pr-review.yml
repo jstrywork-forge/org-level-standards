@@ -1,0 +1,156 @@
+# AI review of a pull request. Advisory only.
+#
+# This pipeline NEVER fails the build and never blocks a merge. It posts one
+# comment. That is a deliberate choice, not a limitation:
+#
+#   - The developer is in charge. A reviewer that blocks is a gate, and a gate
+#     that is sometimes wrong gets routed around within a month.
+#   - The real enforcement already exists. Analysers, warnings-as-errors,
+#     `dotnet format --verify-no-changes` and the tests all run in build.yml and
+#     all fail the build on their own. This step adds judgement, not gating.
+#
+# It follows that when the AI endpoint is unavailable, NOTHING IS LOST that the
+# build was relying on. The step reports that it could not run and exits 0. That
+# is the degraded mode, and it is the same shape as the fully-working mode: the
+# developer reads the code, the build gates it, and this comment is a bonus.
+
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  # Holds the endpoint and key for whichever assistant performs the review.
+  # No secret appears in this file.
+  - group: ai-review
+
+  # The standards repo is read LIVE at review time rather than trusting the copy
+  # synced into this repo. A stale or locally-edited copy must not be able to
+  # weaken the standard the PR is judged against.
+  - name: standardsRepo
+    value: engineering-standards
+  - name: standardsRef
+    value: refs/heads/main
+
+steps:
+  - checkout: self
+    fetchDepth: 0        # the diff needs the merge base, which a shallow clone lacks
+    persistCredentials: true
+
+  # ---------------------------------------------------------------------------
+  # Fetch the authoritative standards.
+  #
+  # continueOnError: the standards repo being unreachable degrades the review to
+  # repo-level only. It does not fail the PR - see the header.
+  # ---------------------------------------------------------------------------
+  - script: |
+      set -e
+      git clone --depth 1 --branch "${STANDARDS_REF##*/}" \
+        "https://$(System.AccessToken)@dev.azure.com/$(System.CollectionUri)/$(System.TeamProject)/_git/$(standardsRepo)" \
+        "$(Agent.TempDirectory)/standards"
+      echo "Standards fetched at $(cd "$(Agent.TempDirectory)/standards" && git rev-parse --short HEAD)"
+    displayName: Fetch org standards
+    continueOnError: true
+    env:
+      STANDARDS_REF: $(standardsRef)
+
+  # ---------------------------------------------------------------------------
+  # Drift check.
+  #
+  # Re-hashes the synced copy in this repo against org.lock.json. A mismatch
+  # means someone hand-edited a file that is meant to be overwritten by the sync,
+  # which is worth SAYING but is not worth blocking a merge over - the live copy
+  # above is what the review actually judges against, so the gate is unaffected.
+  # ---------------------------------------------------------------------------
+  - script: |
+      lock=.github/instructions/org.lock.json
+      [ -f "$lock" ] || { echo "No lock file; repo is not synced to any standards version."; exit 0; }
+
+      fail=0
+      for f in .github/instructions/org/*.md; do
+        name=$(basename "$f")
+        expected=$(grep -o "\"$name\": *\"sha256:[a-f0-9]*\"" "$lock" | grep -o '[a-f0-9]\{64\}')
+        actual=$(sha256sum "$f" | cut -d' ' -f1)
+        if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
+          echo "##vso[task.logissue type=warning]$name has been edited locally; synced standards are overwritten on next sync."
+          fail=1
+        fi
+      done
+      [ $fail -eq 0 ] && echo "Synced standards match the lock file."
+      exit 0
+    displayName: Check synced standards for drift
+
+  # ---------------------------------------------------------------------------
+  # The review itself.
+  #
+  # The call to the assistant is deliberately the ONLY vendor-specific part, and
+  # it is one command. Everything above and below - the diff, the artifacts, the
+  # prompt contract, the comment - is portable. Changing assistant means editing
+  # the marked block, not this pipeline.
+  # ---------------------------------------------------------------------------
+  - script: |
+      set -u
+      diff_file="$(Agent.TempDirectory)/pr.diff"
+      git diff "origin/$(System.PullRequest.TargetBranch)"... > "$diff_file"
+
+      if [ ! -s "$diff_file" ]; then
+        echo "Empty diff; nothing to review."
+        exit 0
+      fi
+
+      # Assemble what the prompt contract says the reviewer is given.
+      {
+        cat pipelines/pr-review-prompt.md
+        echo; echo "## Repository conventions"; echo
+        cat .github/copilot-instructions.md
+        echo; echo "## Organisation standards (authoritative, fetched live)"; echo
+        cat "$(Agent.TempDirectory)"/standards/standards/*.md 2>/dev/null \
+          || cat .github/instructions/org/*.md 2>/dev/null \
+          || echo "(unavailable - review is repo-level only)"
+        echo; echo "## Diff"; echo '```diff'
+        cat "$diff_file"
+        echo '```'
+      } > "$(Agent.TempDirectory)/review-input.md"
+
+      # ---- vendor-specific block: replace this one call ----------------------
+      # <PLACEHOLDER>: confirm the approved endpoint before wiring this up.
+      # Whatever runs here must read review-input.md and write review-output.md.
+      if [ -z "${AI_REVIEW_ENDPOINT:-}" ]; then
+        echo "##vso[task.logissue type=warning]No AI review endpoint configured; skipping. The build still gates this PR."
+        exit 0
+      fi
+
+      curl -sS --fail --max-time 180 \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${AI_REVIEW_KEY}" \
+        --data-binary @<(jq -Rs '{input: .}' "$(Agent.TempDirectory)/review-input.md") \
+        "${AI_REVIEW_ENDPOINT}" \
+        | jq -r '.output // empty' > "$(Agent.TempDirectory)/review-output.md" || {
+          echo "##vso[task.logissue type=warning]AI review call failed. The build still gates this PR."
+          exit 0
+        }
+      # ---- end vendor-specific block -----------------------------------------
+
+      [ -s "$(Agent.TempDirectory)/review-output.md" ] || { echo "Reviewer returned nothing."; exit 0; }
+
+      jq -Rs '{comments: [{parentCommentId: 0, content: ., commentType: 1}], status: 1}' \
+        "$(Agent.TempDirectory)/review-output.md" > "$(Agent.TempDirectory)/thread.json"
+
+      curl -sS --fail -X POST \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $(System.AccessToken)" \
+        --data-binary "@$(Agent.TempDirectory)/thread.json" \
+        "$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.ID)/pullRequests/$(System.PullRequest.PullRequestId)/threads?api-version=7.1" \
+        && echo "Review posted." \
+        || echo "##vso[task.logissue type=warning]Could not post the review comment."
+
+      exit 0
+    displayName: AI review (advisory)
+    env:
+      AI_REVIEW_ENDPOINT: $(aiReviewEndpoint)
+      AI_REVIEW_KEY: $(aiReviewKey)
