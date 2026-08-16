@@ -1,5 +1,11 @@
 # org-level-standards
 
+> **New here, or picking this up in the morning? Read [`START-HERE.md`](START-HERE.md) first.**
+> It says where the work actually stands, what the gaps are, and what each of them costs to close.
+> Then [`docs/how-it-works.md`](docs/how-it-works.md), [`docs/file-by-file.md`](docs/file-by-file.md),
+> and [`docs/working-without-ai.md`](docs/working-without-ai.md). Half an hour, all four.
+
+
 The organisation layer of a two-layer AI-assistance model. It holds the rules
 that are true of **every** repository, and a pipeline syncs them into each one.
 
