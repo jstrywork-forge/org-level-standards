@@ -72,10 +72,16 @@ steps:
       url="$(System.CollectionUri)$(System.TeamProject)/_git/$(standardsRepo)"
 
       if git -c http.extraheader="AUTHORIZATION: bearer $(System.AccessToken)" \
-           clone --depth 1 --branch "$(standardsBranch)" "$url" "$dest" 2>/dev/null; then
+           clone --depth 1 --branch "$(standardsBranch)" "$url" "$dest" 2>"$(Agent.TempDirectory)/clone.err"; then
         echo "Standards fetched at $(git -C "$dest" rev-parse --short HEAD)"
       else
         echo "##vso[task.logissue type=warning]Could not fetch $(standardsRepo). Falling back to the copy synced into this repo."
+        # Print the reason. Swallowing it costs an afternoon: "could not
+        # fetch" is equally true of a missing permission, a wrong branch
+        # name and a typo in the URL, and those need different fixes.
+        echo "--- git said ---"
+        sed -e "s/bearer [A-Za-z0-9._-]*/bearer ***/g" "$(Agent.TempDirectory)/clone.err" 2>/dev/null || true
+        echo "--- url was: $url"
       fi
     displayName: Fetch org standards
     continueOnError: true
