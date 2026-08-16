@@ -32,6 +32,17 @@ pr:
     include:
       - main
 
+# Declaring the standards repository as a RESOURCE is what grants the job token
+# access to it. With "Protect access to repositories in YAML pipelines" enabled -
+# the default on new projects - a permission grant alone is not enough, and a
+# hand-rolled clone fails with TF401019 no matter what the ACL says.
+resources:
+  repositories:
+    - repository: standards
+      type: git
+      name: engineering-standards
+      ref: refs/heads/main
+
 pool:
   vmImage: ubuntu-latest
 
@@ -53,38 +64,22 @@ variables:
   - name: maxDiffBytes
     value: 200000
 
+  # With two checkouts the sources directory gains a folder per repository.
+  - name: repoDir
+    value: $(Build.SourcesDirectory)/whatsapp-template-manager
+  - name: stdDir
+    value: $(Build.SourcesDirectory)/engineering-standards
+
 steps:
+  # Two checkouts, so each repository lands in its own folder under the sources
+  # directory. That moves the working directory, which is why every path below is
+  # anchored to $(repoDir) rather than assumed.
   - checkout: self
     fetchDepth: 0 # the diff needs the merge base, which a shallow clone lacks
     persistCredentials: true
 
-  # ---------------------------------------------------------------------------
-  # Fetch the authoritative standards.
-  #
-  # `System.CollectionUri` is already a full URL ending in a slash, so it is
-  # concatenated - never embedded in another URL. The token goes in an extra
-  # header rather than in the URL, which keeps it out of `git remote -v` and out
-  # of any error message that echoes the remote.
-  # ---------------------------------------------------------------------------
-  - script: |
-      set -uo pipefail
-      dest="$(Agent.TempDirectory)/standards"
-      url="$(System.CollectionUri)$(System.TeamProject)/_git/$(standardsRepo)"
-
-      if git -c http.extraheader="AUTHORIZATION: bearer $(System.AccessToken)" \
-           clone --depth 1 --branch "$(standardsBranch)" "$url" "$dest" 2>"$(Agent.TempDirectory)/clone.err"; then
-        echo "Standards fetched at $(git -C "$dest" rev-parse --short HEAD)"
-      else
-        echo "##vso[task.logissue type=warning]Could not fetch $(standardsRepo). Falling back to the copy synced into this repo."
-        # Print the reason. Swallowing it costs an afternoon: "could not
-        # fetch" is equally true of a missing permission, a wrong branch
-        # name and a typo in the URL, and those need different fixes.
-        echo "--- git said ---"
-        sed -e "s/bearer [A-Za-z0-9._-]*/bearer ***/g" "$(Agent.TempDirectory)/clone.err" 2>/dev/null || true
-        echo "--- url was: $url"
-      fi
-    displayName: Fetch org standards
-    continueOnError: true
+  - checkout: standards
+    fetchDepth: 1
 
   # ---------------------------------------------------------------------------
   # Drift check.
@@ -95,6 +90,7 @@ steps:
   # actually judges against.
   # ---------------------------------------------------------------------------
   - script: |
+      cd "$(repoDir)"
       lock=.github/instructions/org.lock.json
       [ -f "$lock" ] || { echo "No lock file; repo is not synced to any standards version."; exit 0; }
 
@@ -122,8 +118,9 @@ steps:
   # ---------------------------------------------------------------------------
   - script: |
       set -uo pipefail
+      cd "$(repoDir)"
       tmp="$(Agent.TempDirectory)"
-      std="$tmp/standards"
+      std="$(stdDir)"
       diff_file="$tmp/pr.diff"
 
       # System.PullRequest.TargetBranch arrives as `refs/heads/main`, not `main`.
